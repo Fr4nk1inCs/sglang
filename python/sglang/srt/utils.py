@@ -424,7 +424,6 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
 
 
 class LayerFn(Protocol):
-
     def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
 
 
@@ -435,7 +434,7 @@ def make_layers(
     pp_size: Optional[int] = None,
     prefix: str = "",
     return_tuple: bool = False,
-) -> Tuple[int, int, torch.nn.ModuleList]:
+) -> Tuple[torch.nn.ModuleList, int, int]:
     """Make a list of layers with the given layer function"""
     # circula imports
     from sglang.srt.distributed import get_pp_indices
@@ -792,7 +791,6 @@ def maybe_set_triton_cache_manager() -> None:
 class CustomCacheManager(FileCacheManager):
     # Adapted from: https://github.com/tdoublep/vllm/blob/3307522289fdfefe323b6c00d0db696651989a2f/vllm/triton_utils/custom_cache_manager.py
     def __init__(self, key, override=False, dump=False):
-
         self.key = key
         self.lock_path = None
         if dump:
@@ -1294,9 +1292,9 @@ def init_custom_process_group(
         rendezvous,
     )
 
-    assert (store is None) or (
-        init_method is None
-    ), "Cannot specify both init_method and store."
+    assert (store is None) or (init_method is None), (
+        "Cannot specify both init_method and store."
+    )
 
     if store is not None:
         assert world_size > 0, "world_size must be positive if using store"
@@ -1721,13 +1719,13 @@ def kill_itself_when_parent_died():
 def set_uvicorn_logging_configs():
     from uvicorn.config import LOGGING_CONFIG
 
-    LOGGING_CONFIG["formatters"]["default"][
-        "fmt"
-    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["fmt"] = (
+        "[%(asctime)s] %(levelprefix)s %(message)s"
+    )
     LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    LOGGING_CONFIG["formatters"]["access"][
-        "fmt"
-    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["fmt"] = (
+        '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    )
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
 
