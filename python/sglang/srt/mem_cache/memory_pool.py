@@ -236,7 +236,6 @@ class TokenToKVPoolAllocator:
 
 
 class MHATokenToKVPool(KVCache):
-
     def __init__(
         self,
         size: int,
@@ -315,17 +314,25 @@ class MHATokenToKVPool(KVCache):
         # layer_num x [seq_len, head_num, head_dim]
         # layer_num x [page_num, page_size, head_num, head_dim]
         kv_data_ptrs = [
-            self.get_key_buffer(i).data_ptr() for i in range(self.layer_num)
-        ] + [self.get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
+            self.get_key_buffer(i).data_ptr()
+            for i in range(self.start_layer, self.end_layer)
+        ] + [
+            self.get_value_buffer(i).data_ptr()
+            for i in range(self.start_layer, self.end_layer)
+        ]
         kv_data_lens = [
-            self.get_key_buffer(i).nbytes for i in range(self.layer_num)
-        ] + [self.get_value_buffer(i).nbytes for i in range(self.layer_num)]
+            self.get_key_buffer(i).nbytes
+            for i in range(self.start_layer, self.end_layer)
+        ] + [
+            self.get_value_buffer(i).nbytes
+            for i in range(self.start_layer, self.end_layer)
+        ]
         kv_item_lens = [
             self.get_key_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.layer_num)
+            for i in range(self.start_layer, self.end_layer)
         ] + [
             self.get_value_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.layer_num)
+            for i in range(self.start_layer, self.end_layer)
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
@@ -758,7 +765,6 @@ def synchronized(debug_only=False):
 
 
 class HostKVCache(abc.ABC):
-
     def __init__(
         self,
         device_pool: KVCache,

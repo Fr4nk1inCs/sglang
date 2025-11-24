@@ -327,6 +327,7 @@ class Scheduler(
         self.attn_tp_group = self.tp_worker.get_attention_tp_group()
         self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
         self.pp_group = get_pp_group()
+        self.pp_cpu_group = self.pp_group.cpu_group
         self.world_group = get_world_group()
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
@@ -592,7 +593,9 @@ class Scheduler(
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
-                gloo_group=self.attn_tp_cpu_group,
+                gloo_group=(
+                    self.attn_tp_cpu_group if self.pp_size == 1 else self.pp_cpu_group
+                ),
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
@@ -613,9 +616,13 @@ class Scheduler(
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
-                gloo_group=self.attn_tp_cpu_group,
+                gloo_group=(
+                    self.attn_tp_cpu_group if self.pp_size == 1 else self.pp_cpu_group
+                ),
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 transfer_backend=self.transfer_backend,
             )
@@ -642,6 +649,8 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.attn_tp_cpu_group,
                 transfer_backend=self.transfer_backend,
@@ -838,6 +847,8 @@ class Scheduler(
                     recv_reqs.append(recv_rpc)
             else:
                 recv_reqs = None
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            recv_reqs = None
         else:
             if self.attn_tp_rank == 0:
                 dp_offset = self.attn_dp_rank * self.attn_tp_size
@@ -850,6 +861,14 @@ class Scheduler(
                 )
             else:
                 recv_reqs = None
+
+        if self.disaggregation_mode == DisaggregationMode.DECODE and self.pp_size != 1:
+            recv_reqs = broadcast_pyobj(
+                recv_reqs,
+                self.pp_group.rank,
+                self.pp_cpu_group,
+                src=self.pp_group.ranks[0],
+            )
 
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0:
@@ -2505,13 +2524,17 @@ def run_scheduler_process(
             else:
                 scheduler.event_loop_normal()
         elif disaggregation_mode == DisaggregationMode.PREFILL:
-            if scheduler.enable_overlap:
+            if server_args.pp_size > 1:
+                scheduler.event_loop_pp_disagg_prefill()
+            elif scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_prefill()
             else:
                 scheduler.event_loop_normal_disagg_prefill()
 
         elif disaggregation_mode == DisaggregationMode.DECODE:
-            if scheduler.enable_overlap:
+            if server_args.pp_size > 1:
+                scheduler.event_loop_pp_disagg_decode()
+            elif scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_decode()
             else:
                 scheduler.event_loop_normal_disagg_decode()

@@ -43,7 +43,8 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.utils import point_to_point_pyobj
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -68,6 +69,8 @@ class PrefillBootstrapQueue:
         metadata_buffers: MetadataBuffers,
         tp_rank: int,
         tp_size: int,
+        pp_rank: int,
+        pp_size: int,
         bootstrap_port: int,
         gloo_group: ProcessGroup,
         transfer_backend: TransferBackend,
@@ -82,6 +85,8 @@ class PrefillBootstrapQueue:
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
         self.transfer_backend = transfer_backend
         self.scheduler = scheduler
         self.kv_manager = self._init_kv_manager()
@@ -96,7 +101,7 @@ class PrefillBootstrapQueue:
 
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args = KVArgs()
-        kv_args.engine_rank = self.tp_rank
+        kv_args.engine_rank = self.pp_rank * self.tp_size + self.tp_rank
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -296,6 +301,118 @@ class SchedulerDisaggregationPrefillMixin:
                 self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
+            # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
+            # Otherwise, it hangs under high concurrency
+            self.running_batch.batch_is_full = False
+
+    @torch.no_grad()
+    def event_loop_pp_disagg_prefill(self: Scheduler):
+        """A non-overlap scheduler loop for pipeline parallelism."""
+        from sglang.srt.managers.scheduler import GenerationBatchResult
+
+        mbs: List[Optional[ScheduleBatch]] = [None] * self.pp_size
+        last_mbs: List[Optional[ScheduleBatch]] = [None] * self.pp_size
+        self.running_mbs = [
+            ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
+        ]
+        bids: List[Optional[int]] = [None] * self.pp_size
+        pp_outputs: Optional[PPProxyTensors] = None
+
+        while True:
+            server_is_idle = True
+            for mb_id in range(self.pp_size):
+                self.running_batch = self.running_mbs[mb_id]
+                self.last_batch = last_mbs[mb_id]
+
+                recv_reqs = self.recv_requests()
+                self.process_input_requests(recv_reqs)
+                self.waiting_queue.extend(
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                )
+                self.process_prefill_chunk()
+                mbs[mb_id] = self.get_new_batch_prefill()
+                self.running_mbs[mb_id] = self.running_batch
+
+                self.cur_batch = mbs[mb_id]
+                if self.cur_batch:
+                    server_is_idle = False
+                    result = self.run_batch(self.cur_batch)
+
+                # send the outputs to the next step
+                if self.pp_group.is_last_rank:
+                    if self.cur_batch:
+                        next_token_ids, bids[mb_id] = (
+                            result.next_token_ids,
+                            result.bid,
+                        )
+                        pp_outputs = PPProxyTensors({"next_token_ids": next_token_ids})
+                        self.pp_group.send_tensor_dict(
+                            pp_outputs.tensors, all_gather_group=self.attn_tp_group
+                        )
+
+                # receive outputs and post-process (filter finished reqs) the coming microbatch
+                next_mb_id = (mb_id + 1) % self.pp_size
+                next_pp_outputs: Optional[PPProxyTensors] = None
+                if mbs[next_mb_id] is not None:
+                    next_pp_outputs = PPProxyTensors(
+                        self.pp_group.recv_tensor_dict(
+                            all_gather_group=self.attn_tp_group
+                        )
+                    )
+                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
+                    output_result = GenerationBatchResult(
+                        logits_output=None,
+                        pp_hidden_states_proxy_tensors=None,
+                        next_token_ids=next_pp_outputs["next_token_ids"],
+                        extend_input_len_per_req=None,
+                        extend_logprob_start_len_per_req=None,
+                        bid=bids[next_mb_id],
+                        can_run_cuda_graph=result.can_run_cuda_graph,
+                    )
+                    self.process_batch_result_disagg_prefill(
+                        mbs[next_mb_id], output_result
+                    )
+                    last_mbs[next_mb_id] = mbs[next_mb_id]
+
+                # (not last rank)
+                if not self.pp_group.is_last_rank:
+                    if self.cur_batch:
+                        bids[mb_id] = result.bid
+                    # carry the outputs to the next stage
+                    # send the outputs from the last round to let the next stage worker run post processing
+                    if pp_outputs:
+                        self.pp_group.send_tensor_dict(
+                            pp_outputs.tensors, all_gather_group=self.attn_tp_group
+                        )
+
+                    # send out reqs to the next stage
+                    dp_offset = self.attn_dp_rank * self.attn_tp_size
+                    if self.attn_tp_rank == 0:
+                        point_to_point_pyobj(
+                            recv_reqs,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            self.world_group.cpu_group,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            (self.pp_rank + 1) * self.tp_size + dp_offset,
+                        )
+
+                    # send out prefs to the next stage
+                    if self.cur_batch:
+                        self.pp_group.send_tensor_dict(
+                            result.pp_hidden_states_proxy_tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+
+                pp_outputs = next_pp_outputs
+
+            # When the server is idle, self-check and re-init some states
+            if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+
+            if len(self.disagg_prefill_inflight_queue) > 0:
+                self.process_disagg_prefill_inflight_queue()
+
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
             # Otherwise, it hangs under high concurrency
             self.running_batch.batch_is_full = False

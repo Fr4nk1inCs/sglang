@@ -48,8 +48,9 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils import point_to_point_pyobj
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,8 @@ class DecodePreallocQueue:
         gloo_group: ProcessGroup,
         tp_rank: int,
         tp_size: int,
+        pp_rank: int,
+        pp_size: int,
         bootstrap_port: int,
         transfer_backend: TransferBackend,
     ):
@@ -161,6 +164,8 @@ class DecodePreallocQueue:
         self.gloo_group = gloo_group
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
         self.bootstrap_port = bootstrap_port
 
         self.num_reserved_decode_tokens = int(
@@ -174,7 +179,7 @@ class DecodePreallocQueue:
 
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args = KVArgs()
-        kv_args.engine_rank = self.tp_rank
+        kv_args.engine_rank = self.pp_rank * self.tp_size + self.tp_rank
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -443,7 +448,6 @@ class DecodeTransferQueue:
                 indices_to_remove.add(i)
                 continue
             elif poll == KVPoll.Success:
-
                 idx = decode_req.metadata_buffer_index
                 (
                     output_id,
@@ -498,7 +502,6 @@ class DecodeTransferQueue:
 
 
 class SchedulerDisaggregationDecodeMixin:
-
     def _prepare_idle_batch_and_run(self, batch, delay_process=False):
         batch, _ = self.prepare_dp_attn_batch(batch)
         result = None
@@ -631,6 +634,84 @@ class SchedulerDisaggregationDecodeMixin:
 
             self.last_batch = batch
             self.last_batch_in_queue = last_batch_in_queue
+
+    @torch.no_grad()
+    def event_loop_pp_disagg_decode(self: Scheduler):
+        """A non-overlap scheduler loop for pipeline parallelism."""
+        from sglang.srt.managers.scheduler import GenerationBatchResult
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            # polling and allocating kv cache
+            self.process_decode_queue()
+            batch = self.get_next_disagg_decode_batch_to_run()
+            self.cur_batch = batch
+
+            prepare_dp_attn_flag = (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            )
+
+            if batch:
+                # Generate fake extend output.
+                if batch.forward_mode.is_extend():
+                    # Note: Logprobs should be handled on the prefill engine.
+                    self.stream_output(
+                        batch.reqs, any(req.return_logprob for req in batch.reqs)
+                    )
+                    if prepare_dp_attn_flag:
+                        self._prepare_idle_batch_and_run(None)
+                else:
+                    if prepare_dp_attn_flag:
+                        self.prepare_dp_attn_batch(batch)
+                    result = self.run_batch(batch)
+                    if not self.pp_group.is_last_rank:
+                        self.pp_group.send_tensor_dict(
+                            result.pp_hidden_states_proxy_tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+            elif prepare_dp_attn_flag:
+                batch, _ = self._prepare_idle_batch_and_run(None)
+
+            if batch and not batch.forward_mode.is_extend():
+                if self.pp_group.is_last_rank:
+                    next_token_ids = result.next_token_ids
+                    pp_outputs = PPProxyTensors({"next_token_ids": next_token_ids})
+                else:
+                    pp_outputs = PPProxyTensors(
+                        self.pp_group.recv_tensor_dict(
+                            all_gather_group=self.attn_tp_group
+                        )
+                    )
+
+                if self.pp_rank != self.pp_size - 2:
+                    self.pp_group.send_tensor_dict(
+                        pp_outputs.tensors, all_gather_group=self.attn_tp_group
+                    )
+
+                output_result = GenerationBatchResult(
+                    logits_output=None,
+                    pp_hidden_states_proxy_tensors=None,
+                    next_token_ids=pp_outputs["next_token_ids"],
+                    extend_input_len_per_req=None,
+                    extend_logprob_start_len_per_req=None,
+                    bid=result.bid,
+                    can_run_cuda_graph=result.can_run_cuda_graph,
+                )
+                batch.output_ids = pp_outputs["next_token_ids"]
+                self.process_batch_result(batch, output_result)
+
+            if batch is None and (
+                len(self.disagg_decode_transfer_queue.queue)
+                + len(self.disagg_decode_prealloc_queue.queue)
+                == 0
+            ):
+                # When the server is idle, do self-check and re-init some states
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+
+            self.last_batch = batch
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
